@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -33,7 +34,7 @@ MAX_CHANGED_FILES = int(os.getenv('MAX_CHANGED_FILES', '3'))
 CONCURRENCY = int(os.getenv('CONCURRENCY', '3'))
 RPS = float(os.getenv('RPS', '2'))
 OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', '.'))
-API_VERSION = os.getenv('ADO_API_VERSION', '6.1').strip()
+API_VERSION = os.getenv('ADO_API_VERSION', '6.1-preview.1').strip()
 MAX_RETRIES = 5
 MAX_BLOB_BYTES = 3_000_000
 
@@ -167,7 +168,19 @@ class ADO:
         })
 
     async def blob(self, sha):
-        return await self.get(f'/blobs/{sha}', {'$format': 'octetstream'}, binary=True)
+        """Verify each Git blob against its object ID and retry corrupt transfers."""
+        if not isinstance(sha, str) or len(sha) != 40 or any(c not in '0123456789abcdefABCDEF' for c in sha):
+            raise APIError(f'Invalid Git blob SHA: {sha!r}')
+        for attempt in range(3):
+            raw = await self.get(f'/blobs/{sha}', {'$format': 'octetstream'}, binary=True)
+            actual = hashlib.sha1(b'blob ' + str(len(raw)).encode('ascii') + bytes([0]) + raw).hexdigest()
+            if actual.lower() == sha.lower():
+                return raw
+            LOG.warning('Git blob integrity mismatch (attempt %d/3): expected=%s actual=%s bytes=%d',
+                        attempt + 1, sha, actual, len(raw))
+            if attempt < 2:
+                await asyncio.sleep(1 + attempt * 2)
+        raise APIError(f'Corrupted or incomplete Git blob {sha}: three integrity checks failed')
 
     def pr_link(self, pr):
         # Azure DevOps web UI, NOT REST API.
