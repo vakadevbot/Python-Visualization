@@ -544,7 +544,8 @@ async def main():
                     break
                 try:
                     status, data = await collect_pr_files(api, pr)
-                    counters[status] += 1
+                    if status != 'collected':
+                        counters[status] += 1
                     if status == 'collected':
                         collected.append(data)
                     elif status == 'skipped':
