@@ -164,61 +164,89 @@ def resolve_ref(root, ref):
 
 
 def field_count(schema, spec, active=None):
-    """Count object properties recursively, including nested objects and arrays.
+    """Count declared properties, including references, composed schemas and arrays.
 
-    allOf merges child shapes (may double-count repeated properties); for oneOf/anyOf
-    use largest variant, not the sum of mutually exclusive alternatives.
+    Object fields are counted at each nesting level. Recursion cycles are stopped.
+    For alternative shapes the largest option is used (not all options added).
     """
     active = active or frozenset()
     if not isinstance(schema, dict):
         return 0
-    if '$ref' in schema:
-        ref = schema['$ref']
+    ref = schema.get('$ref')
+    if ref:
         if ref in active:
             return 0
         target = resolve_ref(spec, ref)
-        if target is None:
-            return 0
-        return field_count(target, spec, active | {ref})
+        return field_count(target, spec, active | {ref}) if target is not None else 0
     props = schema.get('properties') or {}
-    total = sum(1 + field_count(value, spec, active) for value in props.values() if isinstance(value, dict))
-    for branch in schema.get('allOf', []):
-        total += field_count(branch, spec, active)
+    total = sum(1 + field_count(p, spec, active) for p in props.values() if isinstance(p, dict))
+    total += sum(field_count(s, spec, active) for s in schema.get('allOf', []))
     for key in ('oneOf', 'anyOf'):
-        total += max((field_count(v, spec, active) for v in schema.get(key, [])), default=0)
-    if schema.get('type') == 'array' or 'items' in schema:
-        total += field_count(schema.get('items'), spec, active)
+        total += max((field_count(s, spec, active) for s in schema.get(key, [])), default=0)
+    total += field_count(schema.get('items'), spec, active)
+    # Dictionaries / maps with structured values (additionalProperties: {...})
+    total += field_count(schema.get('additionalProperties'), spec, active)
     return total
 
 
-def request_count(op, spec):
-    total = 0
-    body = op.get('requestBody') or {}
-    if '$ref' in body:
-        body = resolve_ref(spec, body['$ref']) or {}
-    for media in (body.get('content') or {}).values():
-        total = max(total, field_count(media.get('schema'), spec))
-    # OpenAPI 2.0 / Swagger 2.0 body + non-body input parameters
-    for param in op.get('parameters', []):
-        if '$ref' in param:
-            param = resolve_ref(spec, param['$ref']) or {}
+def dereference(value, spec):
+    seen = set()
+    while isinstance(value, dict) and '$ref' in value:
+        ref = value['$ref']
+        if ref in seen:
+            return {}
+        seen.add(ref)
+        value = resolve_ref(spec, ref)
+    return value if isinstance(value, dict) else {}
+
+
+def parameter_count(param, spec):
+    param = dereference(param, spec)
+    if not param:
+        return 0
+    value = 0
+    if param.get('in') == 'body':  # Swagger 2
+        return field_count(param.get('schema'), spec)
+    if param.get('in') not in ('query', 'path', 'header', 'cookie', 'formData'):
+        return 0
+    value = 1 + field_count(param.get('schema'), spec)
+    for media in (param.get('content') or {}).values():
+        value = max(value, 1 + field_count(media.get('schema'), spec))
+    return value
+
+
+def request_count(op, path_item, spec):
+    body = dereference(op.get('requestBody') or {}, spec)
+    body_fields = max((field_count(media.get('schema'), spec)
+                       for media in (body.get('content') or {}).values()), default=0)
+    # Path-level parameters are inherited; operation-level ones may override them.
+    params = {}
+    for param in (path_item.get('parameters') or []) + (op.get('parameters') or []):
+        resolved = dereference(param, spec)
+        if resolved:
+            params[(resolved.get('name'), resolved.get('in'))] = resolved
+    body_from_params = 0
+    other_fields = 0
+    for param in params.values():
         if param.get('in') == 'body':
-            total = max(total, field_count(param.get('schema'), spec))
-        elif param.get('in') in ('query', 'path', 'header', 'formData'):
-            total += 1
-    return total
+            body_from_params = max(body_from_params, parameter_count(param, spec))
+        else:
+            other_fields += parameter_count(param, spec)
+    return max(body_fields, body_from_params) + other_fields
 
 
 def response_count(op, spec):
+    # Different status codes / media types are alternatives, not simultaneous outputs.
     total = 0
-    for status, response in (op.get('responses') or {}).items():
+    for status, raw_response in (op.get('responses') or {}).items():
         if not (str(status).startswith('2') or str(status).lower() == 'default'):
             continue
-        if '$ref' in response:
-            response = resolve_ref(spec, response['$ref']) or {}
+        response = dereference(raw_response, spec)
         candidate = field_count(response.get('schema'), spec)  # Swagger 2.0
         for media in (response.get('content') or {}).values():
             candidate = max(candidate, field_count(media.get('schema'), spec))
+        # Named response headers are also part of the output contract.
+        candidate += len(response.get('headers') or {})
         total = max(total, candidate)
     return total
 
@@ -227,20 +255,25 @@ def analyze_openapi(spec):
     if not isinstance(spec, dict) or not ('openapi' in spec or 'swagger' in spec):
         return None
     biggest = None
-    for path, path_item in (spec.get('paths') or {}).items():
-        if not isinstance(path_item, dict):
-            continue
+    sum_fields = 0
+    operations = 0
+    for path, raw_path_item in (spec.get('paths') or {}).items():
+        path_item = dereference(raw_path_item, spec)
         for verb in ('get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'):
             op = path_item.get(verb)
             if not isinstance(op, dict):
                 continue
-            inp = request_count(op, spec)
+            inp = request_count(op, path_item, spec)
             out = response_count(op, spec)
+            operations += 1
+            sum_fields += inp + out
             if biggest is None or inp + out > biggest['fields']:
                 biggest = {'operation': f'{verb.upper()} {path}', 'request_fields': inp,
                            'response_fields': out, 'fields': inp + out}
+    if biggest is not None:
+        biggest['document_total_fields'] = sum_fields
+        biggest['operation_count'] = operations
     return biggest
-
 
 async def inspect_pr(api, pr):
     pr_id = pr['pullRequestId']
