@@ -27,6 +27,7 @@ ADO_BASE_URL = os.environ.get('ADO_BASE_URL', 'https://dev.azure.com').rstrip('/
 ADO_COLLECTION_URL = os.environ.get('ADO_COLLECTION_URL', '').strip().rstrip('/')
 MONTHS = int(os.getenv('MONTHS', '6'))
 MIN_FIELDS = int(os.getenv('MIN_FIELDS', '20'))
+COUNT_MODE = os.getenv('COUNT_MODE', 'operation').strip().lower()  # operation or document
 MAX_CHANGED_FILES = int(os.getenv('MAX_CHANGED_FILES', '3'))
 CONCURRENCY = int(os.getenv('CONCURRENCY', '3'))
 RPS = float(os.getenv('RPS', '2'))
@@ -290,6 +291,8 @@ async def inspect_pr(api, pr):
         if len(entries) > MAX_CHANGED_FILES or changes.get('nextSkip', 0):
             return 'skipped', {**base, 'reason': f'Более {MAX_CHANGED_FILES} изменённых файлов'}
         matches = []
+        json_files = 0
+        openapi_files = 0
         for entry in entries:
             change_type = str(entry.get('changeType', '')).lower()
             if not any(word in change_type for word in ('add', 'edit', 'rename', 'undelete')):
@@ -298,6 +301,7 @@ async def inspect_pr(api, pr):
             file_path = item.get('path', '')
             if not file_path.lower().endswith('.json') or item.get('isFolder'):
                 continue
+            json_files += 1
             sha = item.get('objectId')
             if not sha:
                 # Do not pretend we checked JSON when there is no blob identifier.
@@ -309,11 +313,18 @@ async def inspect_pr(api, pr):
                 LOG.debug('PR #%s: %s — невалидный JSON', pr_id, file_path)
                 continue
             stats = analyze_openapi(spec)
-            if stats and stats['fields'] >= MIN_FIELDS:
+            if stats:
+                openapi_files += 1
+            score = (stats['document_total_fields'] if COUNT_MODE == 'document' else stats['fields']) if stats else 0
+            if stats and score >= MIN_FIELDS:
                 matches.append({'file': file_path, **stats})
         if matches:
             return 'found', {**base, 'matches': matches}
-        return 'no_match', base
+        reason = ('Нет изменённых JSON-файлов' if not json_files else
+                  'JSON-файлы не распознаны как OpenAPI' if not openapi_files else
+                  'OpenAPI есть, но порог полей не достигнут')
+        LOG.info('PR #%s: %s (JSON: %d, OpenAPI: %d)', pr_id, reason, json_files, openapi_files)
+        return 'no_match', {**base, 'reason': reason}
     except Exception as exc:
         LOG.error('PR #%s: %s', pr_id, exc)
         return 'error', {**base, 'reason': str(exc)}
@@ -329,6 +340,8 @@ def write_csv(path, rows, columns):
 async def main():
     if not all((ADO_PROJECT, ADO_REPO, ADO_PAT)) or not (ADO_ORG or ADO_COLLECTION_URL):
         raise SystemExit('Укажите ADO_PROJECT, ADO_REPO, ADO_PAT и одно из ADO_ORG/ADO_COLLECTION_URL')
+    if COUNT_MODE not in ('operation', 'document'):
+        raise SystemExit('COUNT_MODE должен быть operation или document')
     if CONCURRENCY < 1 or RPS < 1 or MAX_CHANGED_FILES < 1:
         raise SystemExit('CONCURRENCY, RPS, MAX_CHANGED_FILES должны быть >= 1')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -355,6 +368,7 @@ async def main():
         found = []
         skipped = []
         errors = []
+        not_matching = []
         progress = tqdm(total=len(prs), desc='Проверка PR', unit='PR', dynamic_ncols=True)
 
         async def worker():
@@ -374,6 +388,8 @@ async def main():
                         LOG.info('ПРОПУСК PR #%s: %s', data['pr_id'], data['reason'])
                     elif status == 'error':
                         errors.append(data)
+                    elif status == 'no_match':
+                        not_matching.append(data)
                     progress.update(1)
                     progress.set_postfix(found=counters['found'], skipped=counters['skipped'], errors=counters['error'], requests=api.n_requests)
                 finally:
@@ -389,16 +405,18 @@ async def main():
         for pr in sorted(found, key=lambda x: x['pr_id']):
             largest = max(pr['matches'], key=lambda m: m['fields'])
             rows.append({**{k: pr.get(k, '') for k in ('pr_id', 'url', 'title', 'created', 'status')},
-                         'max_fields': largest['fields'], 'request_fields': largest['request_fields'],
+                         'max_fields': largest['fields'], 'document_total_fields': largest['document_total_fields'],
+                         'operation_count': largest['operation_count'], 'request_fields': largest['request_fields'],
                          'response_fields': largest['response_fields'], 'operation': largest['operation'],
                          'files': ' | '.join(x['file'] for x in pr['matches']),
                          'large_files_count': len(pr['matches'])})
-        columns = ['pr_id', 'url', 'title', 'created', 'status', 'max_fields',
+        columns = ['pr_id', 'url', 'title', 'created', 'status', 'max_fields', 'document_total_fields', 'operation_count',
                    'request_fields', 'response_fields', 'operation', 'large_files_count', 'files']
         write_csv(OUTPUT_DIR / 'large_openapi_prs.csv', rows, columns)
         write_csv(OUTPUT_DIR / 'skipped_prs.csv', skipped, ['pr_id', 'url', 'reason', 'title', 'created', 'status'])
         write_csv(OUTPUT_DIR / 'errors_prs.csv', errors, ['pr_id', 'url', 'reason', 'title', 'created', 'status'])
-        summary = {'period_from': since.isoformat(), 'period_to': today.isoformat(),
+        write_csv(OUTPUT_DIR / 'non_matching_prs.csv', not_matching, ['pr_id', 'url', 'reason', 'title', 'created', 'status'])
+        summary = {'count_mode': COUNT_MODE, 'threshold': MIN_FIELDS, 'period_from': since.isoformat(), 'period_to': today.isoformat(),
                    'total_prs': len(prs), 'matching_prs': counters['found'],
                    'skipped_more_than_3_files': counters['skipped'],
                    'errors': counters['error'], 'checked_without_match': counters['no_match'],
