@@ -163,6 +163,43 @@ class ADO:
             return None
         return max(v['id'] for v in values)
 
+    async def iteration_source_commit(self, pr_id, iteration):
+        info = await self.get(f'/pullRequests/{pr_id}/iterations/{iteration}')
+        source = info.get('sourceRefCommit') or {}
+        commit = source.get('commitId')
+        if not commit:
+            raise APIError(f'PR {pr_id} iteration {iteration}: source commit missing')
+        return commit
+
+    async def item_at_commit(self, path, commit, expected_sha):
+        """Fetch historical file via Git Items (not current branch), verify Git SHA."""
+        params = {
+            'path': path,
+            'versionDescriptor.versionType': 'commit',
+            'versionDescriptor.version': commit,
+            'download': 'true',
+            'resolveLfs': 'false',
+        }
+        for attempt in range(3):
+            raw = await self.get('/items', params, binary=True)
+            actual = hashlib.sha1(b'blob ' + str(len(raw)).encode('ascii') + bytes([0]) + raw).hexdigest()
+            if actual.lower() == expected_sha.lower():
+                LOG.info('Git Items fallback OK: %s, bytes=%d', path, len(raw))
+                return raw
+            LOG.warning('Git Items SHA mismatch: %s attempt=%d/3 expected=%s actual=%s bytes=%d',
+                        path, attempt + 1, expected_sha, actual, len(raw))
+            if attempt < 2:
+                await asyncio.sleep(1 + attempt * 2)
+        raise APIError(f'Git Items returned invalid bytes 3 times: {path}')
+
+    async def verified_json_blob(self, pr_id, iteration, file_path, sha):
+        try:
+            return await self.blob(sha)
+        except APIError as exc:
+            LOG.warning('Git Blobs failed for %s: %s; trying Items API', file_path, exc)
+            commit = await self.iteration_source_commit(pr_id, iteration)
+            return await self.item_at_commit(file_path, commit, sha)
+
     async def changes_first_four(self, pr_id, iteration):
         return await self.get(f'/pullRequests/{pr_id}/iterations/{iteration}/changes', {
             '$compareTo': 0,
@@ -368,7 +405,7 @@ async def inspect_pr(api, pr):
             if not sha:
                 # Do not pretend we checked JSON when there is no blob identifier.
                 return 'error', {**base, 'reason': f'Нет objectId: {file_path}'}
-            raw = await api.blob(sha)
+            raw = await api.verified_json_blob(pr_id, iteration, file_path, sha)
             try:
                 spec = json.loads(raw.decode('utf-8-sig'))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -440,7 +477,7 @@ async def diagnose_pr(api, pr_id, ignore_file_limit=False):
             LOG.error('%s: нет objectId в Azure DevOps response', file_path)
             continue
         try:
-            spec = json.loads((await api.blob(sha)).decode('utf-8-sig'))
+            spec = json.loads((await api.verified_json_blob(pr_id, iteration, file_path, sha)).decode('utf-8-sig'))
         except (APIError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             diagnostic_errors += 1
             LOG.error('%s: ошибка загрузки/разбора: %s', file_path, exc)
