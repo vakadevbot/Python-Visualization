@@ -23,13 +23,15 @@ ADO_PROJECT = os.environ.get('ADO_PROJECT', '').strip()
 ADO_REPO = os.environ.get('ADO_REPO', '').strip()  # ID or repo name
 ADO_PAT = os.environ.get('ADO_PAT', '').strip()
 ADO_BASE_URL = os.environ.get('ADO_BASE_URL', 'https://dev.azure.com').rstrip('/')
+# For on-premises, specify complete collection URL, e.g. https://ado.example.com/tfs/DefaultCollection
+ADO_COLLECTION_URL = os.environ.get('ADO_COLLECTION_URL', '').strip().rstrip('/')
 MONTHS = int(os.getenv('MONTHS', '6'))
 MIN_FIELDS = int(os.getenv('MIN_FIELDS', '20'))
 MAX_CHANGED_FILES = int(os.getenv('MAX_CHANGED_FILES', '3'))
 CONCURRENCY = int(os.getenv('CONCURRENCY', '3'))
 RPS = float(os.getenv('RPS', '2'))
 OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', '.'))
-API_VERSION = '7.1'
+API_VERSION = os.getenv('ADO_API_VERSION', '6.1').strip()
 MAX_RETRIES = 5
 MAX_BLOB_BYTES = 3_000_000
 
@@ -63,7 +65,10 @@ class ADO:
     def __init__(self, session):
         self.session = session
         self.limiter = RateLimiter(RPS)
-        base = f'{ADO_BASE_URL}/{quote(ADO_ORG, safe="")}/{quote(ADO_PROJECT, safe="")}'
+        if ADO_COLLECTION_URL:
+            base = f'{ADO_COLLECTION_URL}/{quote(ADO_PROJECT, safe="")}'
+        else:
+            base = f'{ADO_BASE_URL}/{quote(ADO_ORG, safe="")}/{quote(ADO_PROJECT, safe="")}'
         self.root = base + '/_apis/git/repositories/' + quote(ADO_REPO, safe='')
         self.ui_base = base
         self.n_requests = 0
@@ -289,8 +294,8 @@ def write_csv(path, rows, columns):
 
 
 async def main():
-    if not all((ADO_ORG, ADO_PROJECT, ADO_REPO, ADO_PAT)):
-        raise SystemExit('Укажите ADO_ORG, ADO_PROJECT, ADO_REPO и ADO_PAT в переменных окружения')
+    if not all((ADO_PROJECT, ADO_REPO, ADO_PAT)) or not (ADO_ORG or ADO_COLLECTION_URL):
+        raise SystemExit('Укажите ADO_PROJECT, ADO_REPO, ADO_PAT и одно из ADO_ORG/ADO_COLLECTION_URL')
     if CONCURRENCY < 1 or RPS < 1 or MAX_CHANGED_FILES < 1:
         raise SystemExit('CONCURRENCY, RPS, MAX_CHANGED_FILES должны быть >= 1')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -300,8 +305,8 @@ async def main():
     start = time.monotonic()
     today = datetime.now(timezone.utc)
     since = today - relativedelta(months=MONTHS)
-    LOG.info('СТАРТ. Период создания PR: %s — %s, лимит файлов: %s, RPS: %s, workers: %s',
-             since.date(), today.date(), MAX_CHANGED_FILES, RPS, CONCURRENCY)
+    LOG.info('СТАРТ. API %s, период создания PR: %s — %s, лимит файлов: %s, RPS: %s, workers: %s',
+             API_VERSION, since.date(), today.date(), MAX_CHANGED_FILES, RPS, CONCURRENCY)
     auth = aiohttp.BasicAuth('', ADO_PAT)
     timeout = aiohttp.ClientTimeout(total=90)
     async with aiohttp.ClientSession(auth=auth, timeout=timeout, trust_env=True) as session:
