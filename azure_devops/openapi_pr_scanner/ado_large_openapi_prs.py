@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find Azure DevOps PRs changing large OpenAPI JSON contracts (read-only)."""
+"""Find Azure DevOps PRs changing large OpenAPI JSON contracts using local files."""
 import argparse
 import asyncio
 import base64
@@ -40,6 +40,7 @@ OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', '.'))
 API_VERSION = os.getenv('ADO_API_VERSION', '6.1-preview.1').strip()
 MAX_RETRIES = 5
 MAX_BLOB_BYTES = 3_000_000
+LOCAL_REPO_PATH = Path(os.getenv('LOCAL_REPO_PATH', '')).expanduser()
 
 LOG = logging.getLogger('ado-audit')
 
@@ -163,64 +164,12 @@ class ADO:
             return None
         return max(v['id'] for v in values)
 
-    async def iteration_source_commit(self, pr_id, iteration):
-        info = await self.get(f'/pullRequests/{pr_id}/iterations/{iteration}')
-        source = info.get('sourceRefCommit') or {}
-        commit = source.get('commitId')
-        if not commit:
-            raise APIError(f'PR {pr_id} iteration {iteration}: source commit missing')
-        return commit
-
-    async def item_at_commit(self, path, commit, expected_sha):
-        """Fetch historical file via Git Items (not current branch), verify Git SHA."""
-        params = {
-            'path': path,
-            'versionDescriptor.versionType': 'commit',
-            'versionDescriptor.version': commit,
-            'download': 'true',
-            'resolveLfs': 'false',
-        }
-        for attempt in range(3):
-            raw = await self.get('/items', params, binary=True)
-            actual = hashlib.sha1(b'blob ' + str(len(raw)).encode('ascii') + bytes([0]) + raw).hexdigest()
-            if actual.lower() == expected_sha.lower():
-                LOG.info('Git Items fallback OK: %s, bytes=%d', path, len(raw))
-                return raw
-            LOG.warning('Git Items SHA mismatch: %s attempt=%d/3 expected=%s actual=%s bytes=%d',
-                        path, attempt + 1, expected_sha, actual, len(raw))
-            if attempt < 2:
-                await asyncio.sleep(1 + attempt * 2)
-        raise APIError(f'Git Items returned invalid bytes 3 times: {path}')
-
-    async def verified_json_blob(self, pr_id, iteration, file_path, sha):
-        try:
-            return await self.blob(sha)
-        except APIError as exc:
-            LOG.warning('Git Blobs failed for %s: %s; trying Items API', file_path, exc)
-            commit = await self.iteration_source_commit(pr_id, iteration)
-            return await self.item_at_commit(file_path, commit, sha)
-
     async def changes_first_four(self, pr_id, iteration):
         return await self.get(f'/pullRequests/{pr_id}/iterations/{iteration}/changes', {
             '$compareTo': 0,
             '$top': MAX_CHANGED_FILES + 1,
             '$skip': 0,
         })
-
-    async def blob(self, sha):
-        """Verify each Git blob against its object ID and retry corrupt transfers."""
-        if not isinstance(sha, str) or len(sha) != 40 or any(c not in '0123456789abcdefABCDEF' for c in sha):
-            raise APIError(f'Invalid Git blob SHA: {sha!r}')
-        for attempt in range(3):
-            raw = await self.get(f'/blobs/{sha}', {'$format': 'octetstream'}, binary=True)
-            actual = hashlib.sha1(b'blob ' + str(len(raw)).encode('ascii') + bytes([0]) + raw).hexdigest()
-            if actual.lower() == sha.lower():
-                return raw
-            LOG.warning('Git blob integrity mismatch (attempt %d/3): expected=%s actual=%s bytes=%d',
-                        attempt + 1, sha, actual, len(raw))
-            if attempt < 2:
-                await asyncio.sleep(1 + attempt * 2)
-        raise APIError(f'Corrupted or incomplete Git blob {sha}: three integrity checks failed')
 
     def pr_link(self, pr):
         # Azure DevOps web UI, NOT REST API.
@@ -375,149 +324,151 @@ def analyze_openapi(spec):
         biggest['operation_count'] = operations
     return biggest
 
-async def inspect_pr(api, pr):
-    pr_id = pr['pullRequestId']
-    link = api.pr_link(pr)
-    base = {'pr_id': pr_id, 'url': link, 'title': pr.get('title', ''),
-            'created': pr.get('creationDate', ''), 'status': pr.get('status', '')}
+# Local repository is the ADO repository containing contracts, NOT this script's GitHub repo.
+# Store normalized relative paths only; never let ADO paths escape LOCAL_REPO_PATH.
+def normalized_ado_path(path):
+    from pathlib import PurePosixPath
+    if not isinstance(path, str) or not path.startswith('/') or '\\' in path:
+        return None
+    parts = PurePosixPath(path).parts[1:]
+    if not parts or any(p in ('.', '..', '') for p in parts):
+        return None
+    return tuple(parts)
+
+
+class LocalContracts:
+    def __init__(self, root):
+        self.root = root.resolve(strict=True)
+        if not self.root.is_dir():
+            raise ValueError(f'LOCAL_REPO_PATH не каталог: {self.root}')
+        self.index = {}
+        self.cache = {}
+        # Index only JSON files. Sorted traversal keeps resolution reproducible.
+        for path in sorted(self.root.rglob('*')):
+            if not path.is_file() or path.suffix.lower() != '.json':
+                continue
+            resolved = path.resolve()
+            if not resolved.is_relative_to(self.root):
+                continue  # Do not traverse symlinks pointing outside the repo.
+            relative = resolved.relative_to(self.root)
+            self.index.setdefault(tuple(part.casefold() for part in relative.parts), []).append(resolved)
+        LOG.info('Локальных JSON-файлов: %d (корень: %s)', sum(map(len, self.index.values())), self.root)
+
+    def find(self, ado_path):
+        parts = normalized_ado_path(ado_path)
+        if parts is None:
+            raise ValueError(f'Недопустимый путь ADO: {ado_path!r}')
+        keys = tuple(p.casefold() for p in parts)
+        # First exact repo-relative match, then reverse-search longest path suffix.
+        # Never silently choose an ambiguous filename.
+        for n in range(len(keys), 0, -1):
+            suffix = keys[-n:]
+            matches = [p for k, group in self.index.items() if len(k) >= n and k[-n:] == suffix for p in group]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise ValueError(f'Неоднозначный локальный путь {ado_path}: {len(matches)} совпадений по {"/".join(suffix)}')
+        raise FileNotFoundError(f'Не найден локальный JSON: {ado_path}')
+
+    def analyze(self, ado_path):
+        local = self.find(ado_path)
+        if local not in self.cache:
+            try:
+                spec = json.loads(local.read_text(encoding='utf-8-sig'))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f'Некорректный JSON в {local}: {exc}') from exc
+            self.cache[local] = (spec, analyze_openapi(spec))
+        spec, stats = self.cache[local]
+        return local, spec, stats
+
+
+def pr_metadata(api, pr):
+    return {'pr_id': pr['pullRequestId'], 'url': api.pr_link(pr),
+            'title': pr.get('title', ''), 'created': pr.get('creationDate', ''),
+            'status': pr.get('status', '')}
+
+
+async def collect_pr_files(api, pr, ignore_file_limit=False):
+    base = pr_metadata(api, pr)
     try:
-        iteration = await api.last_iteration_id(pr_id)
+        iteration = await api.last_iteration_id(pr['pullRequestId'])
         if iteration is None:
             return 'error', {**base, 'reason': 'Нет итераций'}
-        changes = await api.changes_first_four(pr_id, iteration)
-        entries = changes.get('changeEntries', [])
-        # ADO provides the first 4 changes. This is enough to classify >3.
-        if len(entries) > MAX_CHANGED_FILES or changes.get('nextSkip', 0):
+        if ignore_file_limit:
+            entries = await api.all_changes(pr['pullRequestId'], iteration)
+            more = False
+        else:
+            response = await api.changes_first_four(pr['pullRequestId'], iteration)
+            entries = response.get('changeEntries') or []
+            more = bool(response.get('nextSkip', 0))
+        if not ignore_file_limit and (len(entries) > MAX_CHANGED_FILES or more):
             return 'skipped', {**base, 'reason': f'Более {MAX_CHANGED_FILES} изменённых файлов'}
-        matches = []
-        json_files = 0
-        openapi_files = 0
+        paths = []
         for entry in entries:
             change_type = str(entry.get('changeType', '')).lower()
             if not any(word in change_type for word in ('add', 'edit', 'rename', 'undelete')):
                 continue
             item = entry.get('item') or {}
             file_path = item.get('path', '')
-            if not file_path.lower().endswith('.json') or item.get('isFolder'):
-                continue
-            json_files += 1
-            sha = item.get('objectId')
-            if not sha:
-                # Do not pretend we checked JSON when there is no blob identifier.
-                return 'error', {**base, 'reason': f'Нет objectId: {file_path}'}
-            raw = await api.verified_json_blob(pr_id, iteration, file_path, sha)
-            try:
-                spec = json.loads(raw.decode('utf-8-sig'))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                return 'error', {**base, 'reason': f'Не удалось прочитать JSON {file_path}: {exc}'}
-            stats = analyze_openapi(spec)
-            if stats:
-                openapi_files += 1
-            else:
-                LOG.warning('PR #%s: JSON %s: не найдено HTTP-операций в paths; файл не отвергнут по openapi/swagger', pr_id, file_path)
-            score = (stats['document_total_fields'] if COUNT_MODE == 'document' else stats['fields']) if stats else 0
-            if stats and score >= MIN_FIELDS:
-                matches.append({'file': file_path, **stats})
-        if matches:
-            return 'found', {**base, 'matches': matches}
-        reason = ('Нет изменённых JSON-файлов' if not json_files else
-                  'В JSON нет распознанных HTTP-операций в paths' if not openapi_files else
-                  'В контрактах порог полей не достигнут')
-        LOG.info('PR #%s: %s (JSON: %d, с HTTP-операциями: %d)', pr_id, reason, json_files, openapi_files)
-        return 'no_match', {**base, 'reason': reason}
+            if not item.get('isFolder') and isinstance(file_path, str) and file_path.lower().endswith('.json'):
+                if file_path not in paths:
+                    paths.append(file_path)
+        return 'collected', {**base, 'files_to_check': paths}
     except Exception as exc:
-        LOG.error('PR #%s: %s', pr_id, exc)
+        LOG.error('PR #%s: не удалось собрать пути: %s', pr['pullRequestId'], exc)
         return 'error', {**base, 'reason': str(exc)}
 
 
-
-async def diagnose_pr(api, pr_id, ignore_file_limit=False):
-    """Inspect one PR without fetching the six-month list. Print why it matches or not."""
-    pr = await api.get_pr(pr_id)
-    LOG.info('ДИАГНОСТИКА PR #%s | %s | %s', pr_id, pr.get('title', ''), api.pr_link(pr))
-    iteration = await api.last_iteration_id(pr_id)
-    if iteration is None:
-        LOG.error('Нет итераций; анализ невозможен')
-        return 2
-
-    if ignore_file_limit:
-        entries = await api.all_changes(pr_id, iteration)
-    else:
-        response = await api.changes_first_four(pr_id, iteration)
-        entries = response.get('changeEntries') or []
-
-    limit_exceeded = len(entries) > MAX_CHANGED_FILES
-    if not ignore_file_limit:
-        limit_exceeded = limit_exceeded or bool(response.get('nextSkip', 0))
-    LOG.info('Последняя итерация: %s; изменений: %s%s', iteration,
-             len(entries), ' (показаны первые изменения)' if limit_exceeded and not ignore_file_limit else '')
-    for entry in entries:
-        item = entry.get('item') or {}
-        LOG.info('  %s: %s', entry.get('changeType', '?'), item.get('path', '?'))
-    if limit_exceeded and not ignore_file_limit:
-        LOG.warning('ПРОПУСК: более %d файлов. Для полного анализа запустите с --ignore-file-limit', MAX_CHANGED_FILES)
-        return 3
-
-    any_match = False
-    diagnostic_errors = 0
-    json_count = 0
-    for entry in entries:
-        item = entry.get('item') or {}
-        file_path = item.get('path', '')
-        change_type = str(entry.get('changeType', '')).lower()
-        if not any(word in change_type for word in ('add', 'edit', 'rename', 'undelete')):
-            LOG.info('Не анализируем %s: тип изменения %s', file_path, change_type)
-            continue
-        if item.get('isFolder') or not file_path.lower().endswith('.json'):
-            LOG.info('Не анализируем %s: не JSON-файл', file_path)
-            continue
-        json_count += 1
-        sha = item.get('objectId')
-        if not sha:
-            LOG.error('%s: нет objectId в Azure DevOps response', file_path)
-            continue
+def evaluate_pr(collected, local, verbose=False):
+    paths = collected['files_to_check']
+    if not paths:
+        return 'no_match', {**collected, 'reason': 'Нет добавленных/изменённых JSON-файлов'}
+    matches = []
+    with_operations = 0
+    errors = []
+    for path in paths:
         try:
-            spec = json.loads((await api.verified_json_blob(pr_id, iteration, file_path, sha)).decode('utf-8-sig'))
-        except (APIError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            diagnostic_errors += 1
-            LOG.error('%s: ошибка загрузки/разбора: %s', file_path, exc)
-            continue
-        if not isinstance(spec, dict):
-            LOG.warning('%s: корень JSON не является объектом', file_path)
-            continue
-        LOG.info('=== ФАЙЛ %s | keys=%s ===', file_path, ', '.join(list(spec)[:15]))
-        seen_operations = 0
-        grand_total = 0
-        for path, raw in (spec.get('paths') or {}).items():
-            path_item = dereference(raw, spec)
-            for verb in ('get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'):
-                op = path_item.get(verb)
-                if not isinstance(op, dict):
-                    continue
-                req = request_count(op, path_item, spec)
-                resp = response_count(op, spec)
-                total = req + resp
-                grand_total += total
-                seen_operations += 1
-                LOG.info('  %-6s %-55s REQUEST=%d RESPONSE=%d TOTAL=%d %s',
-                         verb.upper(), path, req, resp, total,
-                         '>= ПОРОГ' if total >= MIN_FIELDS else '< порога')
-        if not seen_operations:
-            LOG.warning('%s: отсутствуют распознаваемые методы в paths (возможно, контракт другого формата)', file_path)
-        score = grand_total if COUNT_MODE == 'document' else (
-            analyze_openapi(spec) or {}).get('fields', 0)
-        match = score >= MIN_FIELDS
-        any_match |= match
-        LOG.info('ИТОГ ФАЙЛА %s | operations=%d | document_total=%d | score(%s)=%d | threshold=%d | %s',
-                 file_path, seen_operations, grand_total, COUNT_MODE, score,
-                 MIN_FIELDS, 'ПОДХОДИТ' if match else 'НЕ ПОДХОДИТ')
-    if not json_count:
-        LOG.warning('В PR нет добавленных/изменённых JSON-файлов')
-    if diagnostic_errors:
-        LOG.error('ИТОГ PR #%s: ПРОВЕРКА НЕПОЛНАЯ, ошибок файлов: %d', pr_id, diagnostic_errors)
-        return 2
-    LOG.info('ИТОГ PR #%s: %s', pr_id, 'ПОДХОДИТ' if any_match else 'НЕ ПОДХОДИТ')
-    return 0 if any_match else 1
+            local_path, spec, stats = local.analyze(path)
+            if verbose:
+                LOG.info('ФАЙЛ %s -> %s', path, local_path)
+                for api_path, raw in (spec.get('paths') or {}).items():
+                    item = dereference(raw, spec)
+                    for verb in ('get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'):
+                        op = item.get(verb)
+                        if isinstance(op, dict):
+                            req, res = request_count(op, item, spec), response_count(op, spec)
+                            LOG.info('  %s %s | REQUEST=%d RESPONSE=%d TOTAL=%d', verb.upper(), api_path, req, res, req + res)
+            if stats:
+                with_operations += 1
+                score = stats['document_total_fields'] if COUNT_MODE == 'document' else stats['fields']
+                if score >= MIN_FIELDS:
+                    matches.append({'file': path, 'local_file': str(local_path), **stats})
+            elif verbose:
+                LOG.warning('Нет HTTP-операций в %s', path)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            errors.append(f'{path}: {exc}')
+            LOG.error('PR #%s: %s', collected['pr_id'], errors[-1])
+    if errors:
+        return 'error', {**collected, 'reason': ' | '.join(errors),
+                         'partial_matches': matches}
+    if matches:
+        return 'found', {**collected, 'matches': matches}
+    return 'no_match', {**collected, 'reason':
+                        'В JSON нет HTTP-операций' if not with_operations else 'Порог полей не достигнут'}
+
+
+async def diagnose_pr(api, pr_id, local, ignore_file_limit=False):
+    pr = await api.get_pr(pr_id)
+    LOG.info('ДИАГНОСТИКА PR #%s | %s', pr_id, api.pr_link(pr))
+    status, data = await collect_pr_files(api, pr, ignore_file_limit)
+    if status != 'collected':
+        LOG.warning('Результат: %s: %s', status, data.get('reason'))
+        return 3 if status == 'skipped' else 2
+    for path in data['files_to_check']:
+        LOG.info('ADO JSON: %s', path)
+    status, result = evaluate_pr(data, local, verbose=True)
+    LOG.info('ИТОГ PR #%s: %s %s', pr_id, status, result.get('reason', ''))
+    return 0 if status == 'found' else 2 if status == 'error' else 1
 
 
 def write_csv(path, rows, columns):
@@ -542,10 +493,16 @@ async def main():
         raise SystemExit('COUNT_MODE должен быть operation или document')
     if CONCURRENCY < 1 or RPS < 1 or MAX_CHANGED_FILES < 1:
         raise SystemExit('CONCURRENCY, RPS, MAX_CHANGED_FILES должны быть >= 1')
+    if not os.getenv('LOCAL_REPO_PATH', '').strip():
+        raise SystemExit('Укажите LOCAL_REPO_PATH — путь к локальному клону ADO-репозитория с JSON')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s',
                         handlers=[logging.FileHandler(OUTPUT_DIR / 'ado_scan.log', encoding='utf-8'),
                                   logging.StreamHandler()])
+    try:
+        local = LocalContracts(LOCAL_REPO_PATH)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f'Ошибка локального репозитория: {exc}') from exc
     start = time.monotonic()
     today = datetime.now(timezone.utc)
     since = today - relativedelta(months=MONTHS)
@@ -557,7 +514,7 @@ async def main():
         api = ADO(session)
         if args.pr_id is not None:
             try:
-                verdict = await diagnose_pr(api, args.pr_id, args.ignore_file_limit)
+                verdict = await diagnose_pr(api, args.pr_id, local, args.ignore_file_limit)
                 LOG.info('Диагностика завершена; HTTP-запросов: %d; длительность: %.1f сек',
                          api.n_requests, time.monotonic() - start)
                 return verdict
@@ -573,6 +530,7 @@ async def main():
             queue.put_nowait(pr)
         counters = {'found': 0, 'skipped': 0, 'error': 0, 'no_match': 0}
         found = []
+        collected = []
         skipped = []
         errors = []
         not_matching = []
@@ -585,11 +543,10 @@ async def main():
                 except asyncio.QueueEmpty:
                     break
                 try:
-                    status, data = await inspect_pr(api, pr)
+                    status, data = await collect_pr_files(api, pr)
                     counters[status] += 1
-                    if status == 'found':
-                        found.append(data)
-                        LOG.info('НАЙДЕН PR #%s: %s | файлов: %d', data['pr_id'], data['url'], len(data['matches']))
+                    if status == 'collected':
+                        collected.append(data)
                     elif status == 'skipped':
                         skipped.append(data)
                         LOG.info('ПРОПУСК PR #%s: %s', data['pr_id'], data['reason'])
@@ -598,7 +555,7 @@ async def main():
                     elif status == 'no_match':
                         not_matching.append(data)
                     progress.update(1)
-                    progress.set_postfix(found=counters['found'], skipped=counters['skipped'], errors=counters['error'], requests=api.n_requests)
+                    progress.set_postfix(collected=len(collected), skipped=counters['skipped'], errors=counters['error'], requests=api.n_requests)
                 finally:
                     queue.task_done()
 
@@ -606,6 +563,18 @@ async def main():
             await asyncio.gather(*(worker() for _ in range(CONCURRENCY)))
         finally:
             progress.close()
+
+        # Stage 2: no further HTTP calls; sequential local resolution/read, with shared cache.
+        LOG.info('Сбор завершён: %d PR. Начинаем последовательную локальную проверку.', len(collected))
+        for item in tqdm(sorted(collected, key=lambda x: x['pr_id'], reverse=True), desc='Локальные JSON', unit='PR'):
+            status, data = evaluate_pr(item, local)
+            counters[status] += 1
+            if status == 'found':
+                found.append(data)
+            elif status == 'error':
+                errors.append(data)
+            else:
+                not_matching.append(data)
 
         # One PR per row, even if there are multiple large OpenAPI JSON files.
         rows = []
@@ -616,9 +585,10 @@ async def main():
                          'operation_count': largest['operation_count'], 'request_fields': largest['request_fields'],
                          'response_fields': largest['response_fields'], 'operation': largest['operation'],
                          'files': ' | '.join(x['file'] for x in pr['matches']),
+                         'local_files': ' | '.join(x['local_file'] for x in pr['matches']),
                          'large_files_count': len(pr['matches'])})
         columns = ['pr_id', 'url', 'title', 'created', 'status', 'max_fields', 'document_total_fields', 'operation_count',
-                   'request_fields', 'response_fields', 'operation', 'large_files_count', 'files']
+                   'request_fields', 'response_fields', 'operation', 'large_files_count', 'files', 'local_files']
         write_csv(OUTPUT_DIR / 'large_openapi_prs.csv', rows, columns)
         write_csv(OUTPUT_DIR / 'skipped_prs.csv', skipped, ['pr_id', 'url', 'reason', 'title', 'created', 'status'])
         write_csv(OUTPUT_DIR / 'errors_prs.csv', errors, ['pr_id', 'url', 'reason', 'title', 'created', 'status'])
@@ -629,7 +599,8 @@ async def main():
                    'errors': counters['error'], 'checked_without_match': counters['no_match'],
                    'http_requests': api.n_requests, 'duration_seconds': round(time.monotonic() - start, 1),
                    'complete': counters['error'] == 0 and counters['skipped'] == 0,
-                   'note': 'Skipped PRs were deliberately not analyzed; matching count is a lower bound.'}
+                   'content_source': 'local_working_tree', 'local_repo_path': str(local.root),
+                   'note': 'Uses current local working tree, not historical PR versions. Skipped/error PRs make match count a lower bound.'}
         (OUTPUT_DIR / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
         LOG.info('ГОТОВО. Найдено PR: %d; пропущено (>3 файлов): %d; ошибок: %d; HTTP: %d; время: %.1f сек',
                  counters['found'], counters['skipped'], counters['error'], api.n_requests, summary['duration_seconds'])
