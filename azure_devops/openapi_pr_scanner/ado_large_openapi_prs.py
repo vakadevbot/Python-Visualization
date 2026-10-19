@@ -18,12 +18,15 @@ from urllib.parse import quote
 import aiohttp
 from dateutil.relativedelta import relativedelta
 from tqdm import tqdm
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------- Configuration (environment variables) ----------
 ADO_ORG = os.environ.get('ADO_ORG', '').strip()
 ADO_PROJECT = os.environ.get('ADO_PROJECT', '').strip()
 ADO_REPO = os.environ.get('ADO_REPO', '').strip()  # ID or repo name
-ADO_PAT = os.environ.get('ADO_PAT', '').strip()
+TFS_TOKEN = os.environ.get('TFS_TOKEN', '').strip()
 ADO_BASE_URL = os.environ.get('ADO_BASE_URL', 'https://dev.azure.com').rstrip('/')
 # For on-premises, specify complete collection URL, e.g. https://ado.example.com/tfs/DefaultCollection
 ADO_COLLECTION_URL = os.environ.get('ADO_COLLECTION_URL', '').strip().rstrip('/')
@@ -496,8 +499,8 @@ async def main():
         parser.error('--ignore-file-limit используется только с --pr-id')
     if args.pr_id is not None and args.pr_id <= 0:
         parser.error('--pr-id должен быть положительным')
-    if not all((ADO_PROJECT, ADO_REPO, ADO_PAT)) or not (ADO_ORG or ADO_COLLECTION_URL):
-        raise SystemExit('Укажите ADO_PROJECT, ADO_REPO, ADO_PAT и одно из ADO_ORG/ADO_COLLECTION_URL')
+    if not all((ADO_PROJECT, ADO_REPO, TFS_TOKEN)) or not (ADO_ORG or ADO_COLLECTION_URL):
+        raise SystemExit('Укажите ADO_PROJECT, ADO_REPO, TFS_TOKEN и одно из ADO_ORG/ADO_COLLECTION_URL')
     if COUNT_MODE not in ('operation', 'document'):
         raise SystemExit('COUNT_MODE должен быть operation или document')
     if CONCURRENCY < 1 or RPS < 1 or MAX_CHANGED_FILES < 1:
@@ -511,7 +514,7 @@ async def main():
     since = today - relativedelta(months=MONTHS)
     LOG.info('СТАРТ. API %s, период создания PR: %s — %s, лимит файлов: %s, RPS: %s, workers: %s',
              API_VERSION, since.date(), today.date(), MAX_CHANGED_FILES, RPS, CONCURRENCY)
-    auth = aiohttp.BasicAuth('', ADO_PAT)
+    auth = aiohttp.BasicAuth('', TFS_TOKEN)
     timeout = aiohttp.ClientTimeout(total=90)
     async with aiohttp.ClientSession(auth=auth, timeout=timeout, trust_env=True) as session:
         api = ADO(session)
