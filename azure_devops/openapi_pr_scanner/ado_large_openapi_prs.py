@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Find Azure DevOps PRs changing large OpenAPI JSON contracts (read-only)."""
+import argparse
 import asyncio
 import base64
 import csv
@@ -127,6 +128,29 @@ class ADO:
             if len(page) < page_size:
                 return results
             offset += len(page)
+
+    async def get_pr(self, pr_id):
+        return await self.get(f'/pullrequests/{pr_id}')
+
+    async def all_changes(self, pr_id, iteration):
+        entries = []
+        skip = 0
+        while True:
+            batch = await self.get(f'/pullRequests/{pr_id}/iterations/{iteration}/changes', {
+                '$compareTo': 0, '$top': 100, '$skip': skip,
+            })
+            page = batch.get('changeEntries') or []
+            entries.extend(page)
+            next_skip = batch.get('nextSkip')
+            if next_skip is not None and int(next_skip) > skip:
+                skip = int(next_skip)
+            elif len(page) == 100:
+                skip += len(page)
+            else:
+                break
+            if not page:
+                break
+        return entries
 
     async def last_iteration_id(self, pr_id):
         obj = await self.get(f'/pullRequests/{pr_id}/iterations')
@@ -353,6 +377,91 @@ async def inspect_pr(api, pr):
         return 'error', {**base, 'reason': str(exc)}
 
 
+
+async def diagnose_pr(api, pr_id, ignore_file_limit=False):
+    """Inspect one PR without fetching the six-month list. Print why it matches or not."""
+    pr = await api.get_pr(pr_id)
+    LOG.info('ДИАГНОСТИКА PR #%s | %s | %s', pr_id, pr.get('title', ''), api.pr_link(pr))
+    iteration = await api.last_iteration_id(pr_id)
+    if iteration is None:
+        LOG.error('Нет итераций; анализ невозможен')
+        return 2
+
+    if ignore_file_limit:
+        entries = await api.all_changes(pr_id, iteration)
+    else:
+        response = await api.changes_first_four(pr_id, iteration)
+        entries = response.get('changeEntries') or []
+
+    limit_exceeded = len(entries) > MAX_CHANGED_FILES
+    if not ignore_file_limit:
+        limit_exceeded = limit_exceeded or bool(response.get('nextSkip', 0))
+    LOG.info('Последняя итерация: %s; изменений: %s%s', iteration,
+             len(entries), ' (показаны первые изменения)' if limit_exceeded and not ignore_file_limit else '')
+    for entry in entries:
+        item = entry.get('item') or {}
+        LOG.info('  %s: %s', entry.get('changeType', '?'), item.get('path', '?'))
+    if limit_exceeded and not ignore_file_limit:
+        LOG.warning('ПРОПУСК: более %d файлов. Для полного анализа запустите с --ignore-file-limit', MAX_CHANGED_FILES)
+        return 3
+
+    any_match = False
+    json_count = 0
+    for entry in entries:
+        item = entry.get('item') or {}
+        file_path = item.get('path', '')
+        change_type = str(entry.get('changeType', '')).lower()
+        if not any(word in change_type for word in ('add', 'edit', 'rename', 'undelete')):
+            LOG.info('Не анализируем %s: тип изменения %s', file_path, change_type)
+            continue
+        if item.get('isFolder') or not file_path.lower().endswith('.json'):
+            LOG.info('Не анализируем %s: не JSON-файл', file_path)
+            continue
+        json_count += 1
+        sha = item.get('objectId')
+        if not sha:
+            LOG.error('%s: нет objectId в Azure DevOps response', file_path)
+            continue
+        try:
+            spec = json.loads((await api.blob(sha)).decode('utf-8-sig'))
+        except (APIError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            LOG.error('%s: ошибка загрузки/разбора: %s', file_path, exc)
+            continue
+        if not isinstance(spec, dict):
+            LOG.warning('%s: корень JSON не является объектом', file_path)
+            continue
+        LOG.info('=== ФАЙЛ %s | keys=%s ===', file_path, ', '.join(list(spec)[:15]))
+        seen_operations = 0
+        grand_total = 0
+        for path, raw in (spec.get('paths') or {}).items():
+            path_item = dereference(raw, spec)
+            for verb in ('get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace'):
+                op = path_item.get(verb)
+                if not isinstance(op, dict):
+                    continue
+                req = request_count(op, path_item, spec)
+                resp = response_count(op, spec)
+                total = req + resp
+                grand_total += total
+                seen_operations += 1
+                LOG.info('  %-6s %-55s REQUEST=%d RESPONSE=%d TOTAL=%d %s',
+                         verb.upper(), path, req, resp, total,
+                         '>= ПОРОГ' if total >= MIN_FIELDS else '< порога')
+        if not seen_operations:
+            LOG.warning('%s: отсутствуют распознаваемые методы в paths (возможно, контракт другого формата)', file_path)
+        score = grand_total if COUNT_MODE == 'document' else (
+            analyze_openapi(spec) or {}).get('fields', 0)
+        match = score >= MIN_FIELDS
+        any_match |= match
+        LOG.info('ИТОГ ФАЙЛА %s | operations=%d | document_total=%d | score(%s)=%d | threshold=%d | %s',
+                 file_path, seen_operations, grand_total, COUNT_MODE, score,
+                 MIN_FIELDS, 'ПОДХОДИТ' if match else 'НЕ ПОДХОДИТ')
+    if not json_count:
+        LOG.warning('В PR нет добавленных/изменённых JSON-файлов')
+    LOG.info('ИТОГ PR #%s: %s', pr_id, 'ПОДХОДИТ' if any_match else 'НЕ ПОДХОДИТ')
+    return 0 if any_match else 1
+
+
 def write_csv(path, rows, columns):
     with path.open('w', newline='', encoding='utf-8-sig') as fh:
         writer = csv.DictWriter(fh, fieldnames=columns, extrasaction='ignore', delimiter=';')
@@ -361,6 +470,14 @@ def write_csv(path, rows, columns):
 
 
 async def main():
+    parser = argparse.ArgumentParser(description='Azure DevOps OpenAPI PR scanner')
+    parser.add_argument('--pr-id', type=int, help='Диагностика одного PR по ID')
+    parser.add_argument('--ignore-file-limit', action='store_true', help='Только с --pr-id: исследовать PR с >3 изменениями')
+    args = parser.parse_args()
+    if args.ignore_file_limit and args.pr_id is None:
+        parser.error('--ignore-file-limit используется только с --pr-id')
+    if args.pr_id is not None and args.pr_id <= 0:
+        parser.error('--pr-id должен быть положительным')
     if not all((ADO_PROJECT, ADO_REPO, ADO_PAT)) or not (ADO_ORG or ADO_COLLECTION_URL):
         raise SystemExit('Укажите ADO_PROJECT, ADO_REPO, ADO_PAT и одно из ADO_ORG/ADO_COLLECTION_URL')
     if COUNT_MODE not in ('operation', 'document'):
@@ -380,6 +497,15 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=90)
     async with aiohttp.ClientSession(auth=auth, timeout=timeout, trust_env=True) as session:
         api = ADO(session)
+        if args.pr_id is not None:
+            try:
+                verdict = await diagnose_pr(api, args.pr_id, args.ignore_file_limit)
+                LOG.info('Диагностика завершена; HTTP-запросов: %d; длительность: %.1f сек',
+                         api.n_requests, time.monotonic() - start)
+                return verdict
+            except Exception as exc:
+                LOG.exception('Диагностика завершилась ошибкой: %s', exc)
+                return 2
         prs = await api.list_prs(since, today)
         # Extra safeguard if server's time filter behaves unexpectedly.
         prs = [p for p in prs if since <= datetime.fromisoformat(p['creationDate'].replace('Z', '+00:00')) <= today]
@@ -453,4 +579,4 @@ async def main():
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()) or 0)
