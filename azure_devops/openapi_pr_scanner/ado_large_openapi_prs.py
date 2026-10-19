@@ -419,6 +419,7 @@ async def diagnose_pr(api, pr_id, ignore_file_limit=False):
         return 3
 
     any_match = False
+    diagnostic_errors = 0
     json_count = 0
     for entry in entries:
         item = entry.get('item') or {}
@@ -438,6 +439,7 @@ async def diagnose_pr(api, pr_id, ignore_file_limit=False):
         try:
             spec = json.loads((await api.blob(sha)).decode('utf-8-sig'))
         except (APIError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            diagnostic_errors += 1
             LOG.error('%s: ошибка загрузки/разбора: %s', file_path, exc)
             continue
         if not isinstance(spec, dict):
@@ -471,6 +473,9 @@ async def diagnose_pr(api, pr_id, ignore_file_limit=False):
                  MIN_FIELDS, 'ПОДХОДИТ' if match else 'НЕ ПОДХОДИТ')
     if not json_count:
         LOG.warning('В PR нет добавленных/изменённых JSON-файлов')
+    if diagnostic_errors:
+        LOG.error('ИТОГ PR #%s: ПРОВЕРКА НЕПОЛНАЯ, ошибок файлов: %d', pr_id, diagnostic_errors)
+        return 2
     LOG.info('ИТОГ PR #%s: %s', pr_id, 'ПОДХОДИТ' if any_match else 'НЕ ПОДХОДИТ')
     return 0 if any_match else 1
 
