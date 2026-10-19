@@ -165,30 +165,50 @@ def resolve_ref(root, ref):
 
 
 def field_count(schema, spec, active=None):
-    """Count declared properties, including references, composed schemas and arrays.
+    """Count nested properties recursively, including arrays and schema composition.
 
-    Object fields are counted at each nesting level. Recursion cycles are stopped.
-    For alternative shapes the largest option is used (not all options added).
+    Each declared property counts once; nested properties count additionally.
+    Local refs are expanded at every use, with recursion-cycle protection.
+    For allOf, branches are combined (duplicate paths are counted once);
+    for oneOf/anyOf the largest branch is selected.
     """
     active = active or frozenset()
     if not isinstance(schema, dict):
         return 0
-    ref = schema.get('$ref')
-    if ref:
-        if ref in active:
-            return 0
-        target = resolve_ref(spec, ref)
-        return field_count(target, spec, active | {ref}) if target is not None else 0
-    props = schema.get('properties') or {}
-    total = sum(1 + field_count(p, spec, active) for p in props.values() if isinstance(p, dict))
-    total += sum(field_count(s, spec, active) for s in schema.get('allOf', []))
-    for key in ('oneOf', 'anyOf'):
-        total += max((field_count(s, spec, active) for s in schema.get(key, [])), default=0)
-    total += field_count(schema.get('items'), spec, active)
-    # Dictionaries / maps with structured values (additionalProperties: {...})
-    total += field_count(schema.get('additionalProperties'), spec, active)
-    return total
 
+    def paths(node, stack, prefix=()):
+        if not isinstance(node, dict):
+            return set()
+        # Support $ref alongside sibling keywords (OpenAPI 3.1 / JSON Schema).
+        result = set()
+        ref = node.get('$ref')
+        if isinstance(ref, str):
+            if ref not in stack:
+                target = resolve_ref(spec, ref)
+                if target is None:
+                    LOG.warning('Unresolved schema reference: %s', ref)
+                else:
+                    result.update(paths(target, stack | {ref}, prefix))
+        props = node.get('properties')
+        if isinstance(props, dict):
+            for name, child in props.items():
+                field_path = prefix + (str(name),)
+                result.add(field_path)
+                result.update(paths(child, stack, field_path))
+        for branch in node.get('allOf') or []:
+            result.update(paths(branch, stack, prefix))
+        for key in ('oneOf', 'anyOf'):
+            choices = [paths(branch, stack, prefix) for branch in (node.get(key) or [])]
+            if choices:
+                result.update(max(choices, key=len))
+        # Array elements belong to the same structural path (not one per item).
+        result.update(paths(node.get('items'), stack, prefix))
+        # additionalProperties represents a map of potentially many keys;
+        # only its statically declared nested schema fields are counted.
+        result.update(paths(node.get('additionalProperties'), stack, prefix))
+        return result
+
+    return len(paths(schema, active))
 
 def dereference(value, spec):
     seen = set()
