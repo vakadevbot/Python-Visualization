@@ -253,7 +253,9 @@ def response_count(op, spec):
 
 
 def analyze_openapi(spec):
-    if not isinstance(spec, dict) or not ('openapi' in spec or 'swagger' in spec):
+    # Every JSON file in this repository is a contract. Do not require
+    # an explicit OpenAPI/Swagger version marker in its root object.
+    if not isinstance(spec, dict):
         return None
     biggest = None
     sum_fields = 0
@@ -309,21 +311,22 @@ async def inspect_pr(api, pr):
             raw = await api.blob(sha)
             try:
                 spec = json.loads(raw.decode('utf-8-sig'))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                LOG.debug('PR #%s: %s — невалидный JSON', pr_id, file_path)
-                continue
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return 'error', {**base, 'reason': f'Не удалось прочитать JSON {file_path}: {exc}'}
             stats = analyze_openapi(spec)
             if stats:
                 openapi_files += 1
+            else:
+                LOG.warning('PR #%s: JSON %s: не найдено HTTP-операций в paths; файл не отвергнут по openapi/swagger', pr_id, file_path)
             score = (stats['document_total_fields'] if COUNT_MODE == 'document' else stats['fields']) if stats else 0
             if stats and score >= MIN_FIELDS:
                 matches.append({'file': file_path, **stats})
         if matches:
             return 'found', {**base, 'matches': matches}
         reason = ('Нет изменённых JSON-файлов' if not json_files else
-                  'JSON-файлы не распознаны как OpenAPI' if not openapi_files else
-                  'OpenAPI есть, но порог полей не достигнут')
-        LOG.info('PR #%s: %s (JSON: %d, OpenAPI: %d)', pr_id, reason, json_files, openapi_files)
+                  'В JSON нет распознанных HTTP-операций в paths' if not openapi_files else
+                  'В контрактах порог полей не достигнут')
+        LOG.info('PR #%s: %s (JSON: %d, с HTTP-операциями: %d)', pr_id, reason, json_files, openapi_files)
         return 'no_match', {**base, 'reason': reason}
     except Exception as exc:
         LOG.error('PR #%s: %s', pr_id, exc)
